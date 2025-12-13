@@ -8,6 +8,7 @@ import '../services/firebase_service.dart';
 import '../services/toast_service.dart';
 import '../widgets/discount_selection_dialog.dart';
 import '../services/qr_code_service.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 class CustomerDetailScreen extends StatefulWidget {
   final Customer customer;
@@ -171,11 +172,66 @@ class _CustomerDetailScreenState extends State<CustomerDetailScreen> {
       if (mounted) {
         ToastService.show(context,
             'Purchase recorded. Added ₹${_newReward.toStringAsFixed(2)} to wallet.');
+        // Prepare and send purchase details via WhatsApp
+        final messageBuffer = StringBuffer();
+        messageBuffer.writeln('Thank you for your purchase, ${widget.customer.name}!');
+        messageBuffer.writeln('Order ID: ${transaction.id}');
+        messageBuffer.writeln('\nItems:');
+        for (final item in transaction.items) {
+          messageBuffer.writeln('- ${item.quantity} x ${item.productName} @ ₹${item.price.toStringAsFixed(2)} = ₹${item.total.toStringAsFixed(2)}');
+        }
+        messageBuffer.writeln('\nSubtotal: ₹${transaction.billAmount.toStringAsFixed(2)}');
+        messageBuffer.writeln('Discount: ₹${transaction.discountApplied.toStringAsFixed(2)}');
+        messageBuffer.writeln('Paid: ₹${transaction.finalPaid.toStringAsFixed(2)}');
+        messageBuffer.writeln('Earned Reward: ₹${transaction.newRewardEarned.toStringAsFixed(2)}');
+        messageBuffer.writeln('Date: ${transaction.date}');
+
+        _sendWhatsAppMessage(widget.customer.phone, messageBuffer.toString());
       }
     } catch (e) {
       if (mounted) {
         ToastService.show(context, 'Error: $e', isError: true);
       }
+    }
+  }
+
+  Future<void> _sendWhatsAppMessage(String phone, String message) async {
+    final encoded = Uri.encodeComponent(message);
+    String digits = phone.replaceAll(RegExp(r'[^0-9+]'), '');
+
+    // Try app deep link first (opens WhatsApp app)
+    Uri? waAppUri;
+    if (digits.isNotEmpty) {
+      // whatsapp:// requires number in international format without +, but some devices accept with +
+      final normalized = digits.replaceAll('+', '');
+      waAppUri = Uri.tryParse('whatsapp://send?phone=$normalized&text=$encoded');
+    } else {
+      waAppUri = Uri.tryParse('whatsapp://send?text=$encoded');
+    }
+
+    try {
+      if (waAppUri != null && await canLaunchUrl(waAppUri)) {
+        await launchUrl(waAppUri, mode: LaunchMode.externalApplication);
+        return;
+      }
+
+      // Fallback to wa.me web link
+      Uri webUri;
+      if (digits.isNotEmpty) {
+        final normalized = digits.replaceAll('+', '');
+        webUri = Uri.parse('https://wa.me/$normalized?text=$encoded');
+      } else {
+        webUri = Uri.parse('https://wa.me/?text=$encoded');
+      }
+
+      if (await canLaunchUrl(webUri)) {
+        await launchUrl(webUri, mode: LaunchMode.externalApplication);
+        return;
+      }
+
+      ToastService.show(context, 'Could not open WhatsApp to send message', isError: true);
+    } catch (e) {
+      ToastService.show(context, 'Error opening WhatsApp: $e', isError: true);
     }
   }
 

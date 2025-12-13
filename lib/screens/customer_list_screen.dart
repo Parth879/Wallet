@@ -1,11 +1,15 @@
 // screens/customer_list_screen.dart
 import 'package:flutter/material.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 import '../models/customer.dart';
 import '../services/firebase_service.dart';
 import '../services/toast_service.dart';
 import '../services/qr_code_service.dart';
 import 'customer_detail_screen.dart';
 import 'qr_scanner_screen.dart';
+
+// Sort options used for customer list ordering
+enum SortOption { name, mostPurchases, recentPurchase }
 
 class CustomerListScreen extends StatefulWidget {
   const CustomerListScreen({super.key});
@@ -18,6 +22,10 @@ class _CustomerListScreenState extends State<CustomerListScreen> {
   String _searchQuery = "";
   final TextEditingController _searchController = TextEditingController();
   double _currentRewardPercentage = 10.0;
+
+  // Sorting options
+  SortOption _currentSort = SortOption.name;
+  List<Customer> _sortedCustomers = [];
 
   @override
   void initState() {
@@ -47,6 +55,55 @@ class _CustomerListScreenState extends State<CustomerListScreen> {
         ToastService.show(context, 'Error: $e', isError: true);
       }
     }
+  }
+
+  // Called when user selects a sort option
+  void _onSortSelected(SortOption option, List<Customer> currentList) {
+    setState(() => _currentSort = option);
+    _sortCustomers(currentList);
+  }
+
+  // Sort customers. For most/recent we query transactions for metadata.
+  Future<void> _sortCustomers(List<Customer> customers) async {
+    if (customers.isEmpty) {
+      setState(() => _sortedCustomers = []);
+      return;
+    }
+
+
+    List<Customer> result = List.from(customers);
+
+    if (_currentSort == SortOption.name) {
+      result.sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
+    } else {
+      // gather metadata for each customer
+      final futures = result.map((c) async {
+        final txColl = FirebaseService.customersCollection.doc(c.id).collection('transactions');
+        final latestSnap = await txColl.orderBy('date', descending: true).limit(1).get();
+        final countSnap = await txColl.get();
+        DateTime latest = DateTime.fromMillisecondsSinceEpoch(0);
+        if (latestSnap.docs.isNotEmpty) {
+          final data = latestSnap.docs.first.data();
+          final d = data['date'];
+          if (d is Timestamp) latest = d.toDate();
+        }
+        return {'customer': c, 'count': countSnap.size, 'latest': latest};
+      }).toList();
+
+      final meta = await Future.wait(futures);
+
+      if (_currentSort == SortOption.mostPurchases) {
+        meta.sort((a, b) => (b['count'] as int).compareTo(a['count'] as int));
+      } else if (_currentSort == SortOption.recentPurchase) {
+        meta.sort((a, b) => (b['latest'] as DateTime).compareTo(a['latest'] as DateTime));
+      }
+
+      result = meta.map((m) => m['customer'] as Customer).toList();
+    }
+
+    setState(() {
+      _sortedCustomers = result;
+    });
   }
 
   @override
@@ -90,6 +147,61 @@ class _CustomerListScreenState extends State<CustomerListScreen> {
                           ),
                           Row(
                             children: [
+                              // Sort / Filter menu (Name / Most Purchases / Recent Purchase)
+                              Container(
+                                decoration: BoxDecoration(
+                                  color: Colors.white,
+                                  shape: BoxShape.circle,
+                                  boxShadow: [
+                                    BoxShadow(
+                                      color: Colors.black.withOpacity(0.05),
+                                      blurRadius: 10,
+                                      offset: const Offset(0, 4),
+                                    ),
+                                  ],
+                                ),
+                                child: PopupMenuButton<int>(
+                                  padding: EdgeInsets.zero,
+                                  icon: Icon(Icons.sort, color: const Color(0xFF009688)),
+                                  onSelected: (value) {
+                                    final currentVisible = _searchQuery.isEmpty
+                                        ? (snapshot.data ?? [])
+                                        : (snapshot.data ?? []).where((customer) {
+                                            return customer.name.toLowerCase().contains(_searchQuery.toLowerCase()) ||
+                                                customer.phone.contains(_searchQuery);
+                                          }).toList();
+
+                                    if (value == 3) {
+                                      // Clear / reset
+                                      setState(() {
+                                        _searchController.clear();
+                                        _searchQuery = "";
+                                        _currentSort = SortOption.name;
+                                        _sortedCustomers = [];
+                                      });
+                                      if (mounted) ToastService.show(context, 'Filters reset');
+                                      return;
+                                    }
+
+                                    // Map int to SortOption
+                                    final opt = (value == 0)
+                                        ? SortOption.name
+                                        : (value == 1)
+                                            ? SortOption.mostPurchases
+                                            : SortOption.recentPurchase;
+
+                                    _onSortSelected(opt, currentVisible);
+                                  },
+                                  itemBuilder: (ctx) => [
+                                    const PopupMenuItem(value: 0, child: Row(children: [Icon(Icons.sort_by_alpha), SizedBox(width:8), Text('Name (A–Z)')])),
+                                    const PopupMenuItem(value: 1, child: Row(children: [Icon(Icons.shopping_cart), SizedBox(width:8), Text('Most Purchases')])),
+                                    const PopupMenuItem(value: 2, child: Row(children: [Icon(Icons.history), SizedBox(width:8), Text('Recently Purchased')])),
+                                    const PopupMenuDivider(),
+                                    const PopupMenuItem(value: 3, child: Text('Clear / Reset filters')),
+                                  ],
+                                ),
+                              ),
+                               const SizedBox(width: 10),
                               // QR Scanner Icon
                               Container(
                                 decoration: BoxDecoration(
@@ -216,14 +328,24 @@ class _CustomerListScreenState extends State<CustomerListScreen> {
                   }
 
                   final allCustomers = snapshot.data ?? [];
+                  // apply search first
                   final filteredCustomers = _searchQuery.isEmpty
-                      ? allCustomers
+                      ? List.from(allCustomers)
                       : allCustomers.where((customer) {
-                    return customer.name
-                        .toLowerCase()
-                        .contains(_searchQuery.toLowerCase()) ||
-                        customer.phone.contains(_searchQuery);
-                  }).toList();
+                          return customer.name.toLowerCase().contains(_searchQuery.toLowerCase()) ||
+                              customer.phone.contains(_searchQuery);
+                        }).toList();
+
+                  // decide display list: prefer sorted results when available & matching size
+                  final needsResort = _sortedCustomers.length != filteredCustomers.length ||
+                      (_sortedCustomers.isNotEmpty && filteredCustomers.isNotEmpty && _sortedCustomers.first.id != filteredCustomers.first.id);
+                  if (needsResort) {
+                    // trigger (async) sort — will update _sortedCustomers when done
+                    _sortCustomers(filteredCustomers.cast<Customer>());
+                  }
+                  final displayList = (_sortedCustomers.isNotEmpty && _sortedCustomers.length == filteredCustomers.length)
+                      ? _sortedCustomers
+                      : filteredCustomers;
 
                   if (filteredCustomers.isEmpty) {
                     return Center(
@@ -245,9 +367,9 @@ class _CustomerListScreenState extends State<CustomerListScreen> {
                   return ListView.builder(
                     padding: const EdgeInsets.symmetric(
                         horizontal: 24, vertical: 0),
-                    itemCount: filteredCustomers.length,
+                    itemCount: displayList.length,
                     itemBuilder: (context, index) {
-                      return _buildCustomerCard(filteredCustomers[index]);
+                      return _buildCustomerCard(displayList[index]);
                     },
                   );
                 },
